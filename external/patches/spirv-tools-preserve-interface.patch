@@ -1,0 +1,212 @@
+diff --git a/include/spirv-tools/optimizer.hpp b/include/spirv-tools/optimizer.hpp
+index fd4527b..281a2cc 100644
+--- a/include/spirv-tools/optimizer.hpp
++++ b/include/spirv-tools/optimizer.hpp
+@@ -558,6 +558,11 @@ Optimizer::PassToken CreateAggressiveDCEPass(bool preserve_interface,
+ // stages.
+ Optimizer::PassToken CreateRemoveUnusedInterfaceVariablesPass();
+ 
++// Preserves user-defined inputs and outputs already listed on each entry point
++// when |preserve_interface| is true. Unused built-ins and resources are removed.
++Optimizer::PassToken CreateRemoveUnusedInterfaceVariablesPass(
++    bool preserve_interface);
++
+ // Creates an empty pass.
+ // This is deprecated and will be removed.
+ // TODO(jaebaek): remove this pass after handling glslang's broken unit tests.
+diff --git a/source/opt/optimizer.cpp b/source/opt/optimizer.cpp
+index 6986501..fb1e388 100644
+--- a/source/opt/optimizer.cpp
++++ b/source/opt/optimizer.cpp
+@@ -170,7 +170,7 @@ Optimizer& Optimizer::RegisterLegalizationPasses(bool preserve_interface) {
+           .RegisterPass(CreateDeadInsertElimPass())
+           .RegisterPass(CreateReduceLoadSizePass())
+           .RegisterPass(CreateAggressiveDCEPass(preserve_interface))
+-          .RegisterPass(CreateRemoveUnusedInterfaceVariablesPass())
++          .RegisterPass(CreateRemoveUnusedInterfaceVariablesPass(preserve_interface))
+           .RegisterPass(CreateInterpolateFixupPass())
+           .RegisterPass(CreateInvocationInterlockPlacementPass())
+           .RegisterPass(CreateOpExtInstWithForwardReferenceFixupPass());
+@@ -534,7 +534,7 @@ bool Optimizer::RegisterPassFromFlag(const std::string& flag,
+   } else if (pass_name == "legalize-hlsl") {
+     RegisterLegalizationPasses(preserve_interface);
+   } else if (pass_name == "remove-unused-interface-variables") {
+-    RegisterPass(CreateRemoveUnusedInterfaceVariablesPass());
++    RegisterPass(CreateRemoveUnusedInterfaceVariablesPass(preserve_interface));
+   } else if (pass_name == "graphics-robust-access") {
+     RegisterPass(CreateGraphicsRobustAccessPass());
+   } else if (pass_name == "wrap-opkill") {
+@@ -901,8 +901,13 @@ Optimizer::PassToken CreateAggressiveDCEPass(bool preserve_interface,
+ }
+ 
+ Optimizer::PassToken CreateRemoveUnusedInterfaceVariablesPass() {
++  return CreateRemoveUnusedInterfaceVariablesPass(false);
++}
++
++Optimizer::PassToken CreateRemoveUnusedInterfaceVariablesPass(
++    bool preserve_interface) {
+   return MakeUnique<Optimizer::PassToken::Impl>(
+-      MakeUnique<opt::RemoveUnusedInterfaceVariablesPass>());
++      MakeUnique<opt::RemoveUnusedInterfaceVariablesPass>(preserve_interface));
+ }
+ 
+ Optimizer::PassToken CreatePropagateLineInfoPass() {
+diff --git a/source/opt/remove_unused_interface_variables_pass.cpp b/source/opt/remove_unused_interface_variables_pass.cpp
+index 61e6eac..c2b6f61 100644
+--- a/source/opt/remove_unused_interface_variables_pass.cpp
++++ b/source/opt/remove_unused_interface_variables_pass.cpp
+@@ -56,7 +56,35 @@ class RemoveUnusedInterfaceVariablesContext {
+       RemoveUnusedInterfaceVariablesPass& parent, Instruction& entry)
+       : parent_(parent), entry_(entry) {}
+ 
+-  void CollectUsedVariables() {
++  void CollectUsedVariables(bool preserve_interface) {
++    if (preserve_interface) {
++      const uint32_t first_interface =
++          entry_.opcode() == spv::Op::OpConditionalEntryPointINTEL ? 4 : 3;
++      for (uint32_t i = first_interface; i < entry_.NumInOperands(); ++i) {
++        const uint32_t id = entry_.GetSingleWordInOperand(i);
++        const auto* var = parent_.get_def_use_mgr()->GetDef(id);
++        const auto storage = spv::StorageClass(var->GetSingleWordInOperand(0));
++        if (storage != spv::StorageClass::Input &&
++            storage != spv::StorageClass::Output)
++          continue;
++
++        // Built-ins may need to be removed to legalize a particular stage.
++        bool builtin = parent_.get_decoration_mgr()->HasDecoration(
++            id, spv::Decoration::BuiltIn);
++        const auto* type = parent_.get_def_use_mgr()->GetDef(var->type_id());
++        while (type->opcode() == spv::Op::OpTypePointer ||
++               type->opcode() == spv::Op::OpTypeArray ||
++               type->opcode() == spv::Op::OpTypeRuntimeArray) {
++          const uint32_t element = type->GetSingleWordInOperand(
++              type->opcode() == spv::Op::OpTypePointer ? 1 : 0);
++          type = parent_.get_def_use_mgr()->GetDef(element);
++        }
++        builtin |= parent_.get_decoration_mgr()->HasDecoration(
++            type->result_id(), spv::Decoration::BuiltIn);
++        if (!builtin && used_variables_.insert(id).second)
++          operands_to_add_.push_back(id);
++      }
++    }
+     std::queue<uint32_t> roots;
+     const int op_i =
+         entry_.opcode() == spv::Op::OpConditionalEntryPointINTEL ? 2 : 1;
+@@ -93,7 +121,7 @@ RemoveUnusedInterfaceVariablesPass::Process() {
+   bool modified = false;
+   for (auto& entry : get_module()->entry_points()) {
+     RemoveUnusedInterfaceVariablesContext context(*this, entry);
+-    context.CollectUsedVariables();
++    context.CollectUsedVariables(preserve_interface_);
+     if (context.ShouldModify()) {
+       context.Modify();
+       modified = true;
+diff --git a/source/opt/remove_unused_interface_variables_pass.h b/source/opt/remove_unused_interface_variables_pass.h
+index a4cb108..2ed289e 100644
+--- a/source/opt/remove_unused_interface_variables_pass.h
++++ b/source/opt/remove_unused_interface_variables_pass.h
+@@ -20,6 +20,13 @@ namespace spvtools {
+ namespace opt {
+ 
+ class RemoveUnusedInterfaceVariablesPass : public Pass {
++ public:
++  explicit RemoveUnusedInterfaceVariablesPass(bool preserve_interface = false)
++      : preserve_interface_(preserve_interface) {}
++
++ private:
++  bool preserve_interface_;
++
+   const char* name() const override {
+     return "remove-unused-interface-variables-pass";
+   }
+@@ -28,4 +35,4 @@ class RemoveUnusedInterfaceVariablesPass : public Pass {
+ }  // namespace opt
+ }  // namespace spvtools
+ 
+-#endif  // SOURCE_OPT_REMOVE_UNUSED_INTERFACE_VARIABLES_PASS_H_
+\ No newline at end of file
++#endif  // SOURCE_OPT_REMOVE_UNUSED_INTERFACE_VARIABLES_PASS_H_
+diff --git a/test/opt/remove_unused_interface_variables_test.cpp b/test/opt/remove_unused_interface_variables_test.cpp
+index bb273e5..f397edc 100644
+--- a/test/opt/remove_unused_interface_variables_test.cpp
++++ b/test/opt/remove_unused_interface_variables_test.cpp
+@@ -223,6 +223,79 @@ TEST_F(RemoveUnusedInterfaceVariablesTest,
+   SinglePassRunAndMatch<RemoveUnusedInterfaceVariablesPass>(spirv, true);
+ }
+ 
++static std::string InterfacePreservationModule(const std::string& interface) {
++  return R"(OpCapability Shader
++OpMemoryModel Logical GLSL450
++OpEntryPoint Fragment %main "main" )" + interface + R"(
++OpExecutionMode %main OriginUpperLeft
++OpName %main "main"
++OpName %unused_input "unused_input"
++OpName %color "color"
++OpName %out "out"
++OpName %unused_output "unused_output"
++OpName %position "position"
++OpName %resource "resource"
++OpName %float "float"
++OpName %v4float "v4float"
++OpName %block "block"
++OpName %input_ptr "input_ptr"
++OpName %output_ptr "output_ptr"
++OpName %uniform_ptr "uniform_ptr"
++OpName %void "void"
++OpName %fn "fn"
++OpName %entry "entry"
++OpName %value "value"
++OpDecorate %unused_input Location 0
++OpDecorate %color Location 1
++OpDecorate %out Location 0
++OpDecorate %unused_output Location 1
++OpDecorate %position BuiltIn FragCoord
++OpDecorate %block Block
++OpMemberDecorate %block 0 Offset 0
++OpDecorate %resource DescriptorSet 0
++OpDecorate %resource Binding 0
++%float = OpTypeFloat 32
++%v4float = OpTypeVector %float 4
++%block = OpTypeStruct %v4float
++%input_ptr = OpTypePointer Input %v4float
++%output_ptr = OpTypePointer Output %v4float
++%uniform_ptr = OpTypePointer Uniform %block
++%void = OpTypeVoid
++%fn = OpTypeFunction %void
++%unused_input = OpVariable %input_ptr Input
++%color = OpVariable %input_ptr Input
++%out = OpVariable %output_ptr Output
++%unused_output = OpVariable %output_ptr Output
++%position = OpVariable %input_ptr Input
++%resource = OpVariable %uniform_ptr Uniform
++%main = OpFunction %void None %fn
++%entry = OpLabel
++%value = OpLoad %v4float %color
++OpStore %out %value
++OpReturn
++OpFunctionEnd
++)";
++}
++
++TEST_F(RemoveUnusedInterfaceVariablesTest, PreserveUserInterfaceOnly) {
++  SetTargetEnv(SPV_ENV_UNIVERSAL_1_4);
++  const auto text = InterfacePreservationModule(
++      "%unused_input %color %out %unused_output %position %resource");
++  const auto expected_text = InterfacePreservationModule(
++      "%unused_input %color %out %unused_output");
++  SinglePassRunAndCheck<RemoveUnusedInterfaceVariablesPass>(
++      text, expected_text, true, true, true);
++}
++
++TEST_F(RemoveUnusedInterfaceVariablesTest, RemoveUserInterfaceByDefault) {
++  SetTargetEnv(SPV_ENV_UNIVERSAL_1_4);
++  const auto text = InterfacePreservationModule(
++      "%unused_input %color %out %unused_output %position %resource");
++  const auto expected_text = InterfacePreservationModule("%color %out");
++  SinglePassRunAndCheck<RemoveUnusedInterfaceVariablesPass>(
++      text, expected_text, true, true);
++}
++
+ }  // namespace
+ }  // namespace opt
+ }  // namespace spvtools

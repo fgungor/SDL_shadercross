@@ -323,6 +323,157 @@ static int SDLCALL shadercross_ReflectSPIRV(void *args)
     return TEST_COMPLETED;
 }
 
+static Uint32 shadercross_read_u32(const Uint8 *data)
+{
+    Uint32 value;
+    SDL_memcpy(&value, data, sizeof(value));
+    return SDL_Swap32LE(value);
+}
+
+static bool shadercross_check_dxil_inputs(const void *bytecode, size_t size)
+{
+    const Uint8 *data = bytecode;
+    Uint32 part_count, i;
+
+    if (size < 32 || SDL_memcmp(data, "DXBC", 4) != 0) {
+        return false;
+    }
+    part_count = shadercross_read_u32(data + 28);
+    if (part_count > (size - 32) / 4) {
+        return false;
+    }
+    for (i = 0; i < part_count; ++i) {
+        Uint32 offset = shadercross_read_u32(data + 32 + 4 * i);
+        const Uint8 *signature;
+        Uint32 signature_size, params, j;
+        if (offset > size - 8) {
+            return false;
+        }
+        if (SDL_memcmp(data + offset, "ISG1", 4) != 0) {
+            continue;
+        }
+        signature_size = shadercross_read_u32(data + offset + 4);
+        if (signature_size < 8 || signature_size > size - offset - 8) {
+            return false;
+        }
+        signature = data + offset + 8;
+        params = shadercross_read_u32(signature + 4);
+        if (shadercross_read_u32(signature) != 2 || params > signature_size ||
+            signature_size - params < 2 * 32) {
+            return false;
+        }
+        for (j = 0; j < 2; ++j) {
+            const Uint8 *param = signature + params + 32 * j;
+            Uint32 name = shadercross_read_u32(param + 4);
+            if (name > signature_size || signature_size - name < 9 ||
+                SDL_memcmp(signature + name, "TEXCOORD", 9) != 0 ||
+                shadercross_read_u32(param + 8) != j ||
+                shadercross_read_u32(param + 20) != j) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+static int SDLCALL shadercross_preserve_interface(void *args)
+{
+    static const char source[] =
+        "struct Input { float4 unused : TEXCOORD0; float4 color : TEXCOORD1;\n"
+        "#if !VERTEX\nfloat4 position : SV_Position;\n#endif\n};\n"
+        "#if VERTEX\n#define SPACE space0\n#define TARGET SV_Position\n"
+        "#else\n#define SPACE space2\n#define TARGET SV_Target0\n#endif\n"
+        "#if RESOURCE_KIND == 1\n"
+        "Texture2D<float4> textures[2] : register(t0, SPACE);\n"
+        "SamplerState samplers[2] : register(s0, SPACE);\n"
+        "#elif RESOURCE_KIND == 2\n"
+        "StructuredBuffer<float4> buffer : register(t0, SPACE);\n#endif\n"
+        "float4 main(Input input) : TARGET {\n"
+        "#if RESOURCE_KIND == 1\n"
+        "return input.color * (textures[0].SampleLevel(samplers[0], float2(0,0), 0) +\n"
+        "textures[1].SampleLevel(samplers[1], float2(0,0), 0));\n"
+        "#elif RESOURCE_KIND == 2\nreturn input.color * buffer[0];\n"
+        "#else\nreturn input.color;\n#endif\n}\n";
+    char *resource_kinds[] = { "0", "1", "2" };
+    int vertex, kind;
+    (void)args;
+
+    if (!(SDL_ShaderCross_GetHLSLShaderFormats() & SDL_GPU_SHADERFORMAT_SPIRV) ||
+        !(SDL_ShaderCross_GetHLSLShaderFormats() & SDL_GPU_SHADERFORMAT_DXIL)) {
+        return TEST_SKIPPED;
+    }
+    for (vertex = 0; vertex < 2; ++vertex) {
+        for (kind = 0; kind < 3; ++kind) {
+            SDL_ShaderCross_HLSL_Define defines[] = {
+                { "VERTEX", vertex ? "1" : "0" },
+                { "RESOURCE_KIND", resource_kinds[kind] },
+                { NULL, NULL }
+            };
+            SDL_ShaderCross_HLSL_Info hlsl_info;
+            SDL_ShaderCross_SPIRV_Info spirv_info;
+            SDL_ShaderCross_GraphicsShaderMetadata *metadata;
+            void *spirv, *dxil;
+            size_t spirv_size = 0, dxil_size = 0;
+            Uint32 i, locations = 0;
+
+            SDLTest_Log("Preserve interface: vertex=%d, resource kind=%d", vertex, kind);
+            SDL_zero(hlsl_info);
+            hlsl_info.source = source;
+            hlsl_info.entrypoint = "main";
+            hlsl_info.shader_stage = vertex ? SDL_SHADERCROSS_SHADERSTAGE_VERTEX : SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT;
+            hlsl_info.defines = defines;
+            spirv = SDL_ShaderCross_CompileSPIRVFromHLSL(&hlsl_info, &spirv_size);
+            SDLTest_AssertCheck(spirv != NULL, "Compile interface test to SPIRV (%s)", SDL_GetError());
+            if (!spirv) {
+                continue;
+            }
+            metadata = SDL_ShaderCross_ReflectGraphicsSPIRV(spirv, spirv_size, 0);
+            SDLTest_AssertCheck(metadata != NULL, "Reflect interface test (%s)", SDL_GetError());
+            if (metadata) {
+                for (i = 0; i < metadata->num_inputs; ++i) {
+                    if (metadata->inputs[i].location < 2) {
+                        locations |= 1u << metadata->inputs[i].location;
+                    }
+                }
+                SDLTest_AssertCheck(metadata->num_inputs == 1 && locations == 2,
+                                    "Reflection reports the active input at its declared location 1");
+                SDLTest_AssertCheck(metadata->resource_info.num_samplers == (kind == 1 ? 2u : 0u),
+                                    "Resource arrays still flatten into two bindings");
+                SDLTest_AssertCheck(metadata->resource_info.num_storage_buffers == (kind == 2 ? 1u : 0u),
+                                    "Structured buffers remain supported");
+                SDL_free(metadata);
+            }
+
+            dxil = SDL_ShaderCross_CompileDXILFromHLSL(&hlsl_info, &dxil_size);
+            SDLTest_AssertCheck(dxil != NULL, "Compile HLSL to DXIL (%s)", SDL_GetError());
+            if (dxil) {
+                SDLTest_AssertCheck(shadercross_check_dxil_inputs(dxil, dxil_size),
+                                    "HLSL -> DXIL retains TEXCOORD0/1 in registers 0/1");
+                SDL_free(dxil);
+            }
+            SDL_zero(spirv_info);
+            spirv_info.bytecode = spirv;
+            spirv_info.bytecode_size = spirv_size;
+            spirv_info.entrypoint = "main";
+            spirv_info.shader_stage = hlsl_info.shader_stage;
+            dxil = SDL_ShaderCross_CompileDXILFromSPIRV(&spirv_info, &dxil_size);
+            SDLTest_AssertCheck(dxil != NULL, "Compile SPIRV to DXIL (%s)", SDL_GetError());
+            if (dxil) {
+                SDLTest_AssertCheck(shadercross_check_dxil_inputs(dxil, dxil_size),
+                                    "SPIRV -> DXIL retains TEXCOORD0/1 in registers 0/1");
+                SDL_free(dxil);
+            }
+            SDL_free(spirv);
+        }
+    }
+    return TEST_COMPLETED;
+}
+
+static const SDLTest_TestCaseReference shadercrossPreserveInterface = {
+    shadercross_preserve_interface, "shadercross_PreserveInterface", "Preserve unused stage inputs through legalization and DXIL compilation", TEST_ENABLED
+};
+
 static const SDLTest_TestCaseReference shadercrossInitQuit = {
     shadercross_testInitQuit, "shadercrossInitQuit", "Test SDL_ShaderCross_Init and SDL_ShaderCross_Quit", TEST_ENABLED
 };
@@ -349,6 +500,7 @@ static const SDLTest_TestCaseReference *shadercrossTests[] = {
     &shadercrossCompileSPIRV,
     &shadercrossTranspileSPIRVToMSL,
     &shadercrossReflectSPIRV,
+    &shadercrossPreserveInterface,
     NULL
 };
 
