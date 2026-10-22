@@ -69,10 +69,10 @@ typedef struct SDL_ShaderCross_IOVarMetadata {
 
 typedef struct SDL_ShaderCross_GraphicsShaderResourceInfo
 {
-    Uint32 num_samplers;                     /**< The number of samplers defined in the shader. */
-    Uint32 num_storage_textures;             /**< The number of storage textures defined in the shader. */
-    Uint32 num_storage_buffers;              /**< The number of storage buffers defined in the shader. */
-    Uint32 num_uniform_buffers;              /**< The number of uniform buffers defined in the shader. */
+    Uint32 num_samplers;                     /**< Sampled texture/sampler slot span, including gaps and arrays. */
+    Uint32 num_storage_textures;             /**< Storage texture slot span after the sampler span. */
+    Uint32 num_storage_buffers;              /**< Storage buffer slot span after the sampler and storage texture spans. */
+    Uint32 num_uniform_buffers;              /**< Uniform buffer slot span, including gaps and arrays. */
 } SDL_ShaderCross_GraphicsShaderResourceInfo;
 
 typedef struct SDL_ShaderCross_GraphicsShaderMetadata
